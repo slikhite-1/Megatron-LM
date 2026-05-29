@@ -215,27 +215,30 @@ def _apply_rotary_pos_emb_thd(
         )
         mla_rotary_interleaved = multi_latent_attention
 
+    if mla_rotary_interleaved is None:
+        mla_rotary_interleaved = multi_latent_attention
+
     if cp_group is None:
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
     seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
+    sequence_splits = torch.split(t, seqlens)
 
     # Handle two different frequency tensor formats:
     # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
     #    -> Use offset-based mapping for exact positional correspondence
     # 2. Otherwise: freqs contains only max sequence length positions
     #    -> Use traditional mapping without offsets (map first :seqlen part)
+    output = torch.empty_like(t)
+    output_offset = 0
     if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]:
         # CASE 1: Exact mapping with offsets
-        # Build packed freqs in one pass, then apply once to the whole packed tensor
-        sequence_splits = torch.split(t, seqlens)
-        freq_slices = []
         for i, x in enumerate(sequence_splits):
             # cu_seqlens[i] is the starting offset of this sequence in the original batch
             seq_start_offset = cu_seqlens[i].item()
-            freq_slices.append(
-                _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
+            freq_slice = _get_thd_freqs_on_this_cp_rank(
+                cp_rank, cp_size, x, freqs, seq_start_offset
             )
 
         freqs_packed = torch.cat(freq_slices, dim=0)
@@ -249,12 +252,17 @@ def _apply_rotary_pos_emb_thd(
         ).squeeze(1)
     else:
         # CASE 2: Traditional mapping without offsets
-        # Build packed freqs for all sequences using the standard mapping, then apply once
-        sequence_splits = torch.split(t, seqlens)
-        freqs_packed = torch.cat(
-            [_get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs) for x in sequence_splits],
-            dim=0,
-        )
+        for x in sequence_splits:
+            freq_slice = _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs)
+            output_slice = _apply_rotary_pos_emb_bshd(
+                x.unsqueeze(1),
+                freq_slice,
+                rotary_interleaved=rotary_interleaved,
+                mla_rotary_interleaved=mla_rotary_interleaved,
+                mscale=mscale,
+            ).squeeze(1)
+            output.narrow(0, output_offset, x.size(0)).copy_(output_slice)
+            output_offset += x.size(0)
 
         return _apply_rotary_pos_emb_bshd(
             t.unsqueeze(1),
@@ -283,6 +291,8 @@ def apply_rotary_pos_emb(
     # Keep for backward compatibility. Will deprecate in the future.
     if cp_group is None:
         cp_group = parallel_state.get_context_parallel_group()
+    if mla_rotary_interleaved is None:
+        mla_rotary_interleaved = config.multi_latent_attention
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
