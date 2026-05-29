@@ -22,14 +22,18 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
     _build_causal_mask_from_positions,
+    _build_fused_indexer_varlen_bounds,
     _build_packed_allgather_cp_query_positions_and_key_reorder,
     _build_zigzag_allgather_cp_key_reorder,
     _compute_index_scores,
+    _fused_qk_topk_lighting,
+    _fused_qk_topk_lighting_with_streaming_sparse_kl,
     _generate_varlen_mask_params,
     _get_cp_positions_from_layout,
     _scatter_topk_into_index_mask,
     _unfused_absorbed_dsa_fn,
     compute_dsa_indexer_loss,
+    compute_dsa_indexer_loss_topk_sparse,
     fused_qk_topk_naive,
     rotate_activation,
     unfused_dsa_fn,
@@ -75,12 +79,124 @@ def _build_packed_causal_mask_for_test(
     return mask
 
 
+def _fake_lighting_indexer_for_test(
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    index_w: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    index_topk: int,
+    topk_indices: torch.Tensor | None = None,
+    use_relu: bool = True,
+):
+    """Reference fake indexer for testing fused batched loop plumbing."""
+    del topk_indices
+
+    # [sq, h, d] @ [sk, d]^T -> [sq, h, sk]
+    logits = torch.einsum("qhd,kd->qhk", index_q.float(), index_k.float())
+    if use_relu:
+        logits = torch.relu(logits)
+    logits = logits * index_w.float().unsqueeze(-1)
+    logits = logits.sum(dim=1)  # [sq, sk]
+
+    key_pos = torch.arange(index_k.size(0), dtype=torch.int64, device=logits.device)
+    valid = (key_pos.unsqueeze(0) >= starts.to(torch.int64).unsqueeze(-1)) & (
+        key_pos.unsqueeze(0) < ends.to(torch.int64).unsqueeze(-1)
+    )
+    logits = logits.masked_fill(~valid, float("-inf"))
+
+    topk_k = min(index_topk, logits.size(-1))
+    topk_scores, topk_idx = torch.topk(logits, topk_k, dim=-1)
+    topk_idx = topk_idx.to(torch.int32)
+    topk_idx = topk_idx.masked_fill(topk_scores == float("-inf"), -1)
+    return topk_scores, topk_idx
+
+
+def _fake_lighting_indexer_without_invalid_slot_mask_for_test(
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    index_w: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    index_topk: int,
+    topk_indices: torch.Tensor | None = None,
+    use_relu: bool = True,
+):
+    """Fake fused indexer that leaves invalid top-k slots unmasked."""
+    del topk_indices
+
+    logits = torch.einsum("qhd,kd->qhk", index_q.float(), index_k.float())
+    if use_relu:
+        logits = torch.relu(logits)
+    logits = logits * index_w.float().unsqueeze(-1)
+    logits = logits.sum(dim=1)
+
+    key_pos = torch.arange(index_k.size(0), dtype=torch.int64, device=logits.device)
+    valid = (key_pos.unsqueeze(0) >= starts.to(torch.int64).unsqueeze(-1)) & (
+        key_pos.unsqueeze(0) < ends.to(torch.int64).unsqueeze(-1)
+    )
+    logits = logits.masked_fill(~valid, float("-inf"))
+
+    topk_k = min(index_topk, logits.size(-1))
+    topk_scores, topk_idx = torch.topk(logits, topk_k, dim=-1)
+    return topk_scores, topk_idx.to(torch.int32)
+
+
+def _fake_fused_scores_indices_for_test(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    index_topk: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build fused-style batched/chunked top-k scores+indices with fake indexer."""
+    sq, b = q.size(0), q.size(1)
+    scores_out, idx_out = None, None
+    for bi in range(b):
+        for s0 in range(0, sq, block_size):
+            s1 = min(s0 + block_size, sq)
+            scores_chunk, idx_chunk = _fake_lighting_indexer_for_test(
+                q[:, bi][s0:s1],
+                k[:, bi],
+                weights[:, bi][s0:s1],
+                starts[s0:s1],
+                ends[s0:s1],
+                index_topk,
+            )
+            if scores_out is None:
+                scores_out = torch.empty(
+                    (b, sq, scores_chunk.size(-1)),
+                    dtype=scores_chunk.dtype,
+                    device=scores_chunk.device,
+                )
+            if idx_out is None:
+                idx_out = torch.empty(
+                    (b, sq, idx_chunk.size(-1)), dtype=idx_chunk.dtype, device=idx_chunk.device
+                )
+            scores_out[bi, s0:s1].copy_(scores_chunk)
+            idx_out[bi, s0:s1].copy_(idx_chunk)
+    assert scores_out is not None and idx_out is not None
+    return scores_out, idx_out
+
+
+class _FakeTPGroup:
+    def size(self) -> int:
+        return 1
+
+
 class _FakeCPGroup:
     def __init__(self, size: int):
         self._size = size
 
     def size(self) -> int:
         return self._size
+
+
+class _FakePGCollection:
+    def __init__(self):
+        self.tp = _FakeTPGroup()
 
 
 @pytest.fixture(autouse=True)
@@ -408,6 +524,220 @@ class TestDSACPPositionHelpers:
         assert key.grad is not None and torch.isfinite(key.grad).all()
         assert value.grad is not None and torch.isfinite(value.grad).all()
 
+    def test_fused_topk_batched_loop_matches_reference(self):
+        """Fused batched/chunked top-k loop should match per-batch reference outputs."""
+        sq, skv, bsz, heads, dim = 9, 13, 3, 4, 8
+        topk = 5
+        block_size = 4
+
+        q = torch.randn(sq, bsz, heads, dim, dtype=torch.float32)
+        k = torch.randn(skv, bsz, dim, dtype=torch.float32)
+        weights = torch.randn(sq, bsz, heads, dtype=torch.float32)
+        starts = torch.zeros(sq, dtype=torch.int32)
+        ends = torch.arange(1, sq + 1, dtype=torch.int32).clamp_max(skv)
+
+        expected = []
+        for bi in range(bsz):
+            _, ref_idx = _fake_lighting_indexer_for_test(
+                q[:, bi], k[:, bi], weights[:, bi], starts, ends, topk
+            )
+            expected.append(ref_idx)
+        expected = torch.stack(expected, dim=0)
+
+        with patch(
+            "megatron.core.transformer.experimental_attention_variant.dsa.lighting_indexer",
+            _fake_lighting_indexer_for_test,
+        ):
+            got = _fused_qk_topk_lighting(
+                q=q,
+                k=k,
+                weights=weights,
+                index_topk=topk,
+                starts=starts,
+                ends=ends,
+                block_size=block_size,
+            )
+
+        assert got is not None
+        assert got.shape == expected.shape
+        assert got.dtype == expected.dtype
+        assert torch.equal(got, expected)
+
+    def test_fused_streaming_sparse_kl_matches_reference(self):
+        """Streaming fused sparse-KL path should match reference top-k sparse KL."""
+        sq, skv, bsz, heads, dim = 10, 12, 2, 4, 8
+        topk = 6
+        block_size = 4
+        softmax_scale = dim**-0.5
+
+        q = torch.randn(sq, bsz, heads, dim, dtype=torch.float32)
+        k = torch.randn(skv, bsz, dim, dtype=torch.float32)
+        weights = torch.randn(sq, bsz, heads, dtype=torch.float32)
+        # MQA key for target attention distribution.
+        query = torch.randn(sq, bsz, heads, dim, dtype=torch.float32)
+        key = torch.randn(skv, bsz, 1, dim, dtype=torch.float32)
+        starts = torch.zeros(sq, dtype=torch.int32)
+        ends = torch.arange(1, sq + 1, dtype=torch.int32).clamp_max(skv)
+        fake_pg = _FakePGCollection()
+
+        ref_scores, ref_idx = _fake_fused_scores_indices_for_test(
+            q, k, weights, starts, ends, topk, block_size
+        )
+        ref_loss = compute_dsa_indexer_loss_topk_sparse(
+            index_topk_scores=ref_scores,
+            topk_indices=ref_idx,
+            query=query,
+            key=key,
+            softmax_scale=softmax_scale,
+            loss_coeff=1.0,
+            pg_collection=fake_pg,
+        )
+
+        with patch(
+            "megatron.core.transformer.experimental_attention_variant.dsa.lighting_indexer",
+            _fake_lighting_indexer_for_test,
+        ):
+            fused_out = _fused_qk_topk_lighting_with_streaming_sparse_kl(
+                q=q,
+                k=k,
+                weights=weights,
+                index_topk=topk,
+                starts=starts,
+                ends=ends,
+                block_size=block_size,
+                query=query,
+                key=key,
+                softmax_scale=softmax_scale,
+                loss_coeff=1.0,
+                pg_collection=fake_pg,
+            )
+
+        assert fused_out is not None
+        got_idx, got_loss = fused_out
+        assert torch.equal(got_idx, ref_idx)
+        torch.testing.assert_close(got_loss, ref_loss, rtol=1e-5, atol=1e-5)
+
+    def test_fused_topk_sanitizes_invalid_slots(self):
+        """Fused top-k wrapper should convert invalid kernel slots to -1."""
+        sq, skv, bsz, heads, dim = 6, 9, 2, 3, 8
+        topk = 4
+        block_size = 3
+
+        q = torch.randn(sq, bsz, heads, dim, dtype=torch.float32)
+        k = torch.randn(skv, bsz, dim, dtype=torch.float32)
+        weights = torch.randn(sq, bsz, heads, dtype=torch.float32)
+        starts = torch.zeros(sq, dtype=torch.int32)
+        ends = torch.tensor([1, 2, 2, 3, 3, 4], dtype=torch.int32)
+
+        expected = []
+        for bi in range(bsz):
+            _, ref_idx = _fake_lighting_indexer_for_test(
+                q[:, bi], k[:, bi], weights[:, bi], starts, ends, topk
+            )
+            expected.append(ref_idx)
+        expected = torch.stack(expected, dim=0)
+
+        with patch(
+            "megatron.core.transformer.experimental_attention_variant.dsa.lighting_indexer",
+            _fake_lighting_indexer_without_invalid_slot_mask_for_test,
+        ):
+            got = _fused_qk_topk_lighting(
+                q=q,
+                k=k,
+                weights=weights,
+                index_topk=topk,
+                starts=starts,
+                ends=ends,
+                block_size=block_size,
+            )
+
+        assert got is not None
+        assert torch.equal(got, expected)
+
+    def test_fused_streaming_sparse_kl_sanitizes_invalid_slots(self):
+        """Streaming sparse-KL path should ignore invalid kernel slots beyond row bounds."""
+        sq, skv, bsz, heads, dim = 8, 10, 2, 4, 8
+        topk = 5
+        block_size = 4
+        softmax_scale = dim**-0.5
+
+        q = torch.randn(sq, bsz, heads, dim, dtype=torch.float32)
+        k = torch.randn(skv, bsz, dim, dtype=torch.float32)
+        weights = torch.randn(sq, bsz, heads, dtype=torch.float32)
+        query = torch.randn(sq, bsz, heads, dim, dtype=torch.float32)
+        key = torch.randn(skv, bsz, 1, dim, dtype=torch.float32)
+        starts = torch.zeros(sq, dtype=torch.int32)
+        ends = torch.tensor([1, 2, 2, 3, 3, 4, 4, 5], dtype=torch.int32)
+        fake_pg = _FakePGCollection()
+
+        ref_scores, ref_idx = _fake_fused_scores_indices_for_test(
+            q, k, weights, starts, ends, topk, block_size
+        )
+        ref_loss = compute_dsa_indexer_loss_topk_sparse(
+            index_topk_scores=ref_scores,
+            topk_indices=ref_idx,
+            query=query,
+            key=key,
+            softmax_scale=softmax_scale,
+            loss_coeff=1.0,
+            pg_collection=fake_pg,
+        )
+
+        with patch(
+            "megatron.core.transformer.experimental_attention_variant.dsa.lighting_indexer",
+            _fake_lighting_indexer_without_invalid_slot_mask_for_test,
+        ):
+            fused_out = _fused_qk_topk_lighting_with_streaming_sparse_kl(
+                q=q,
+                k=k,
+                weights=weights,
+                index_topk=topk,
+                starts=starts,
+                ends=ends,
+                block_size=block_size,
+                query=query,
+                key=key,
+                softmax_scale=softmax_scale,
+                loss_coeff=1.0,
+                pg_collection=fake_pg,
+            )
+
+        assert fused_out is not None
+        got_idx, got_loss = fused_out
+        assert torch.equal(got_idx, ref_idx)
+        torch.testing.assert_close(got_loss, ref_loss, rtol=1e-5, atol=1e-5)
+
+    def test_fused_bounds_disable_on_per_batch_mask_mismatch(self):
+        """Fused bounds should disable when batched masks are not identical."""
+        sq, skv, bsz = 5, 7, 2
+        base_mask = torch.triu(
+            torch.full((sq, skv), float("-inf"), dtype=torch.float32), diagonal=1
+        )
+        mask = base_mask.unsqueeze(0).expand(bsz, -1, -1).clone()
+        out = _build_fused_indexer_varlen_bounds(
+            sq=sq,
+            skv=skv,
+            device=mask.device,
+            mask=mask,
+            varlen_starts=None,
+            varlen_ends=None,
+            key_positions=None,
+        )
+        assert out is not None
+
+        # Change one batch mask so masks are no longer identical.
+        mask[1, 0, 0] = float("-inf")
+        out_mismatch = _build_fused_indexer_varlen_bounds(
+            sq=sq,
+            skv=skv,
+            device=mask.device,
+            mask=mask,
+            varlen_starts=None,
+            varlen_ends=None,
+            key_positions=None,
+        )
+        assert out_mismatch is None
+
     def test_scatter_topk_chunked_matches_manual_with_negative_indices(self):
         """Chunked top-k scatter should match manual behavior for -1 invalid indices."""
         b, sq, skv = 2, 4, 6
@@ -532,6 +862,34 @@ class TestDSAIndexerLossRowMaskCPU:
             sparse_loss=False,
             pg_collection=self._fake_pg_collection(),
             mask=mask[:1],
+        )
+
+        torch.testing.assert_close(masked_loss, trimmed_loss)
+
+    def test_sparse_indexer_loss_ignores_padded_rows(self):
+        index_topk_scores = torch.tensor([[[2.0, float("-inf")], [0.9, 0.1]]], dtype=torch.float32)
+        topk_indices = torch.tensor([[[0, 1], [1, 0]]], dtype=torch.int64)
+        query = torch.tensor([[[[1.0, 0.0]]], [[[0.0, 1.0]]]], dtype=torch.float32)
+        key = torch.tensor([[[[1.0, 0.0]]], [[[0.0, 1.0]]]], dtype=torch.float32)
+
+        masked_loss = compute_dsa_indexer_loss_topk_sparse(
+            index_topk_scores=index_topk_scores.clone(),
+            topk_indices=topk_indices,
+            query=query,
+            key=key,
+            softmax_scale=1.0,
+            loss_coeff=1.0,
+            pg_collection=self._fake_pg_collection(),
+            query_valid_rows=torch.tensor([True, False], dtype=torch.bool),
+        )
+        trimmed_loss = compute_dsa_indexer_loss_topk_sparse(
+            index_topk_scores=index_topk_scores[:, :1, :].clone(),
+            topk_indices=topk_indices[:, :1, :].clone(),
+            query=query[:1].clone(),
+            key=key,
+            softmax_scale=1.0,
+            loss_coeff=1.0,
+            pg_collection=self._fake_pg_collection(),
         )
 
         torch.testing.assert_close(masked_loss, trimmed_loss)
