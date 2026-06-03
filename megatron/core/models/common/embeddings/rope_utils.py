@@ -234,12 +234,14 @@ def _apply_rotary_pos_emb_thd(
     output_offset = 0
     if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]:
         # CASE 1: Exact mapping with offsets
+        freq_slices = []
         for i, x in enumerate(sequence_splits):
             # cu_seqlens[i] is the starting offset of this sequence in the original batch
             seq_start_offset = cu_seqlens[i].item()
             freq_slice = _get_thd_freqs_on_this_cp_rank(
                 cp_rank, cp_size, x, freqs, seq_start_offset
             )
+            freq_slices.append(freq_slice)
 
         freqs_packed = torch.cat(freq_slices, dim=0)
 
