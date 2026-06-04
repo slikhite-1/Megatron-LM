@@ -191,7 +191,7 @@ def bwd(
     sm_scale=None,
     is_causal=True,
     block_size=32,
-    num_stages=0,
+    num_stages=2,
     threads=128,
     indices_dtype=T.int32,
     dtype=T.bfloat16,
