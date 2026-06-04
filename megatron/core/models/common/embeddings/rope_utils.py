@@ -266,13 +266,7 @@ def _apply_rotary_pos_emb_thd(
             output.narrow(0, output_offset, x.size(0)).copy_(output_slice)
             output_offset += x.size(0)
 
-        return _apply_rotary_pos_emb_bshd(
-            t.unsqueeze(1),
-            freqs_packed,
-            rotary_interleaved=rotary_interleaved,
-            mla_rotary_interleaved=mla_rotary_interleaved,
-            mscale=mscale,
-        ).squeeze(1)
+        return output
 
 
 def apply_rotary_pos_emb(
