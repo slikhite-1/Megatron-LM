@@ -70,14 +70,23 @@ def _get_preprocess_kernel(H: int, D: int):
         return kernel
 
 
+def _normalize_block_h(block_h: int) -> int:
+    if block_h >= 64:
+        return 64
+    if block_h >= 32:
+        return 32
+    return 16
+
+
 def _get_bwd_kernel(
-    H: int, D: int, D_tail: int, topk: int, kv_group: int, sm_scale, is_causal: bool
+    H: int, D: int, D_tail: int, topk: int, kv_group: int, sm_scale, max_block_h: int
 ):
-    key = (H, D, D_tail, topk, kv_group, _normalize_sm_scale(sm_scale), is_causal)
+    max_block_h = _normalize_block_h(max_block_h)
+    key = (H, D, D_tail, topk, kv_group, _normalize_sm_scale(sm_scale), max_block_h)
     with _tilelang_sparse_mla_bwd_cache_lock:
         kernel = _tilelang_sparse_mla_bwd_kernel_cache.pop(key, None)
         if kernel is None:
-            kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, is_causal)
+            kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, max_block_h=max_block_h)
         _cache_put_lru(_tilelang_sparse_mla_bwd_kernel_cache, key, kernel)
         return kernel
 
@@ -189,8 +198,8 @@ def bwd(
     topk,
     kv_group=1,
     sm_scale=None,
-    is_causal=True,
     block_size=32,
+    max_block_h=32,
     num_stages=2,
     threads=128,
     indices_dtype=T.int32,
@@ -199,7 +208,6 @@ def bwd(
 ):
     """Build sparse-MLA backward kernel."""
     require_tilelang()
-    assert is_causal == True, "non-casual is not supported now"
     assert (
         topk % block_size == 0
     ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -228,7 +236,7 @@ def bwd(
 
     H = H_kv
     padded_H = max(tilelang.math.next_power_of_2(H_kv), 16)
-    block_H = min(64, padded_H)
+    block_H = min(_normalize_block_h(max_block_h), padded_H)
     assert padded_H % block_H == 0
     NH = padded_H // block_H
     BS = block_size
@@ -414,13 +422,13 @@ def sparse_mla_delta(o, do):
     return preprocess_kernel(o, do).squeeze(0)
 
 
-def sparse_mla_bwd(
-    q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None
-):
+def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, delta=None):
     """Run sparse-MLA backward kernels and return (dq, dkv)."""
     require_tilelang()
+
     seq_bucket = _env_int("MCORE_DSA_TILELANG_SEQ_BUCKET", 256)
     topk_bucket = _env_int("MCORE_DSA_TILELANG_TOPK_BUCKET", _SPARSE_MLA_BWD_BLOCK_SIZE)
+    max_block_h = _env_int("MCORE_DSA_TILELANG_BWD_MAX_BLOCK_H", 32)
 
     q = q.unsqueeze(0)
     kv = kv.unsqueeze(0)
@@ -500,7 +508,7 @@ def sparse_mla_bwd(
 
     # Get kernels
     preprocess_kernel = _get_preprocess_kernel(H, D)
-    bwd_kernel = _get_bwd_kernel(H, D, D_tail, topk_bucketed, kv_group, sm_scale, is_casual)
+    bwd_kernel = _get_bwd_kernel(H, D, D_tail, topk_bucketed, kv_group, sm_scale, max_block_h)
     postprocess_kernel = _get_postprocess_kernel(D, D_tail, kv_group)
 
     if delta is None:

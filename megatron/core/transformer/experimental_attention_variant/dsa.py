@@ -858,10 +858,9 @@ def _compute_topk_target_chunk_sum(
 
             chunk_max = logits.max(dim=-1).values
             m_new = torch.maximum(m, chunk_max)
-            alpha = torch.exp(m - m_new)
-            alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
-            p_chunk = torch.exp(logits - m_new.unsqueeze(-1))
-            p_chunk = torch.nan_to_num(p_chunk, nan=0.0, posinf=0.0, neginf=0.0)
+            m_new_for_exp = torch.where(torch.isfinite(m_new), m_new, torch.zeros_like(m_new))
+            alpha = torch.exp(m - m_new_for_exp)
+            p_chunk = torch.exp(logits - m_new_for_exp.unsqueeze(-1))
             l = l * alpha + p_chunk.sum(dim=-1)
             m = m_new
 
@@ -890,7 +889,6 @@ def _compute_topk_target_chunk_sum(
 
             logits = logits.masked_fill(~valid_topk_chunk.unsqueeze(0), float("-inf"))
             probs = torch.exp(logits - stable_m.unsqueeze(-1)) * inv_l.unsqueeze(-1)
-            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
             attn_chunk_sum[:, t0:t1] += probs.sum(dim=0)
 
     return attn_chunk_sum
@@ -2809,9 +2807,7 @@ def unfused_dsa_fn(
                     )
                     m_new = torch.maximum(m, logits.max(dim=-1).values)
                     alpha = torch.exp(m - m_new)
-                    alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
                     p = torch.exp(logits - m_new.unsqueeze(-1))
-                    p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
                     acc = acc * alpha.unsqueeze(-1) + torch.einsum(
                         "hst,hstd->hsd", p, v_sel.float()
                     )

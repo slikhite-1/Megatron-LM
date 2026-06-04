@@ -64,7 +64,6 @@ def _get_sparse_mla_fwd_kernel(
     topk: int,
     kv_group: int,
     sm_scale,
-    is_causal: bool,
     block_I: int,
     num_stages: int,
     threads: int,
@@ -76,7 +75,6 @@ def _get_sparse_mla_fwd_kernel(
         topk,
         kv_group,
         _normalize_sm_scale(sm_scale),
-        is_causal,
         block_I,
         num_stages,
         threads,
@@ -91,7 +89,6 @@ def _get_sparse_mla_fwd_kernel(
                 topk,
                 kv_group,
                 sm_scale,
-                is_causal,
                 block_I=block_I,
                 num_stages=num_stages,
                 threads=threads,
@@ -112,27 +109,14 @@ _SPARSE_MLA_FWD_PASS_CONFIGS = (
 
 @tilelang_jit(out_idx=[-2, -1], pass_configs=_SPARSE_MLA_FWD_PASS_CONFIGS)
 def sparse_mla_fwd(
-    heads,
-    dim,
-    tail_dim,
-    topk,
-    kv_group=1,
-    sm_scale=None,
-    is_causal=True,
-    CP0=True,
-    block_I=64,
-    num_stages=2,
-    threads=256,
+    heads, dim, tail_dim, topk, kv_group=1, sm_scale=None, block_I=64, num_stages=2, threads=256
 ):
     """Build sparse-MLA forward kernel."""
     require_tilelang()
-    assert dim == tilelang.math.next_power_of_2(
-        dim
-    ), f"haven't check padding correctness yet, dim={dim}"
+    assert dim == tilelang.math.next_power_of_2(dim), f"dim must be a power of two, got dim={dim}"
     assert tail_dim == tilelang.math.next_power_of_2(
         tail_dim
-    ), f"haven't check padding correctness yet, dim={tail_dim}"
-    assert is_causal == True, "non-causal is not supported"
+    ), f"tail_dim must be a power of two, got tail_dim={tail_dim}"
     assert (
         topk % block_I == 0
     ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -260,11 +244,14 @@ def sparse_mla_fwd(
                 T.copy(acc_s, S_shared)
                 T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
-            # Rescale
+            # Rescale. Packed THD can produce sentinel-only rows; define those rows as zero
+            # output/LSE instead of dividing by a zero softmax denominator.
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
+                acc_o[h_i, d_i] = T.if_then_else(sumexp[h_i] > 0, acc_o[h_i, d_i] / sumexp[h_i], 0)
             for h_i in T.Parallel(H_per_block):
-                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                sumexp[h_i] = T.if_then_else(
+                    sumexp[h_i] > 0, T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale, 0
+                )
 
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
             T.copy(sumexp, Lse[b_i, s_i, H0:H1])
@@ -273,15 +260,7 @@ def sparse_mla_fwd(
 
 
 def sparse_mla_fwd_interface(
-    q,
-    kv,
-    indices,
-    sm_scale=None,
-    return_p_sum: bool = False,
-    d_v=512,
-    block_I=64,
-    num_stages=2,
-    threads=256,
+    q, kv, indices, sm_scale=None, d_v=512, block_I=64, num_stages=2, threads=256
 ):
     """Run sparse-MLA forward kernel and return (out, lse)."""
     require_tilelang()
@@ -292,8 +271,6 @@ def sparse_mla_fwd_interface(
     kv = kv.unsqueeze(0)
     indices = indices.unsqueeze(0)
 
-    is_causal = True
-    assert return_p_sum == False, "This kernel file is for fwd only"
     assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
     batch, seq_len, heads, dim_plus_tail_dim = q.shape
     _, seq_len_kv, kv_group, kv_dim = kv.shape
@@ -349,7 +326,6 @@ def sparse_mla_fwd_interface(
         topk=topk_bucketed,
         kv_group=kv_group,
         sm_scale=sm_scale,
-        is_causal=is_causal,
         block_I=block_I,
         num_stages=num_stages,
         threads=threads,
