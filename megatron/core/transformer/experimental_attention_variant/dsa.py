@@ -744,6 +744,8 @@ def _fused_qk_topk_lighting(
     """Run fused tilelang indexer and return top-k indices [b, sq, topk]."""
     if lighting_indexer is None:
         return None
+    if index_topk >= k.size(0):
+        return None
     if q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
         return None
 
@@ -1051,6 +1053,8 @@ def _fused_qk_topk_lighting_with_streaming_sparse_kl(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Run fused tilelang indexer and stream top-k logits directly into sparse KL accumulation."""
     if lighting_indexer is None:
+        return None
+    if index_topk >= k.size(0):
         return None
     if q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
         return None
